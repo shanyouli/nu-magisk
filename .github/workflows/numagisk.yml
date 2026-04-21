@@ -21,10 +21,10 @@ jobs:
 
       - name: Prepare Module Structure
         run: |
-          mkdir -p nushell_module/system/bin
+          mkdir -p nushell/system/bin
           
           # 写入 module.prop
-          cat <<EOF > nushell_module/module.prop
+          cat <<EOF > nushell/module.prop
           id=nushell
           name=Nushell for Android
           version=${{ steps.get_tag.outputs.TAG }}
