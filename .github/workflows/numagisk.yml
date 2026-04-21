@@ -25,7 +25,7 @@ jobs:
           
           # 写入 module.prop
           cat <<EOF > nushell_module/module.prop
-          id=nushell_magisk
+          id=nushell
           name=Nushell for Android
           version=${{ steps.get_tag.outputs.TAG }}
           versionCode=$(date +%Y%m%d)
@@ -42,26 +42,26 @@ jobs:
           tar -xzf nushell.tar.gz
           
           # 将二进制文件移动到模块目录
-          mv nu-*/nu nushell_module/system/bin/
-          chmod +x nushell_module/system/bin/nu
+          mv nu-*/nu nushell/system/bin/
+          chmod +x nushell/system/bin/nu
 
       - name: Zip Module
         run: |
-          cd nushell_module
-          zip -r ../nushell-magisk-${{ steps.get_tag.outputs.TAG }}.zip ./*
+          cd nushell
+          zip -r ../nushell-${{ steps.get_tag.outputs.TAG }}.zip ./*
           
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nushell-magisk
-          path: nushell-magisk-*.zip
+          name: nushell
+          path: nushell-*.zip
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         if: github.event_name != 'pull_request'
         with:
           tag_name: ${{ steps.get_tag.outputs.TAG }}
-          files: nushell-magisk-*.zip
+          files: nushell-*.zip
           body: |
             Automated build of Nushell ${{ steps.get_tag.outputs.TAG }} for Magisk.
             Binary source: [Nushell Releases](https://github.com/nushell/nushell/releases)
