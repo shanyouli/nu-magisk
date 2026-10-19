@@ -1,69 +1,323 @@
-name: Build Nushell Magisk Module
+name: 🐚 Build Nushell Module (KernelSU / Magisk)
+
+# 遵循 KernelSU 模块规范构建: https://kernelsu.org/guide/module.html
+#   - module.prop: id 须匹配 ^[a-zA-Z][a-zA-Z0-9._-]+$，versionCode 必须为整数，LF 换行
+#   - customize.sh: 使用 ui_print / abort / set_perm，检测 KernelSU 环境并提示 metamodule
+#   - system/bin/nu: systemless 覆盖 /system/bin/nu
 
 on:
   workflow_dispatch: # 手动触发
+    inputs:
+      tag:
+        description: 🏷️ 指定要构建的 Nushell 版本（如 v0.116.1，留空 = 自动获取最新）
+        type: string
+        required: false
+        default: ''
+      force:
+        description: 💪 强制重建（即使该版本已发布过）
+        type: boolean
+        required: false
+        default: false
   schedule:
-    - cron: '0 0 * * 1' # 每周一自动检查更新
+    - cron: '0 0 * * 1' # 每周一自动跟踪上游新版本
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-nushell-module
+  cancel-in-progress: false
+
+env:
+  NU_TARGET: aarch64-unknown-linux-musl # musl 静态链接，无 glibc 依赖
+  MOD_DIR: nushell_module
+  MOD_ID: nushell_magisk
 
 jobs:
   build:
+    name: 📦 Build & release module
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout
+      - name: 🔍 Checkout
         uses: actions/checkout@v4
 
-      - name: Get Latest Nushell Tag
-        id: get_tag
+      # ── 1️⃣ 解析目标版本（手动指定 > 上游最新；已发布自动跳过）──
+      - name: 🏷️ Resolve Nushell version
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }} # gh 认证调用，避免匿名 API 限流
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
         run: |
-          TAG=$(curl -s https://api.github.com/repos/nushell/nushell/releases/latest | jq -r .tag_name)
-          echo "TAG=$TAG" >> $GITHUB_OUTPUT
-          echo "VERSION=${TAG#v}" >> $GITHUB_OUTPUT
+          set -euo pipefail
 
-      - name: Prepare Module Structure
+          # 1️⃣ 确定上游版本：手动指定优先，否则取最新稳定版
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+            case "$TAG" in v*) ;; *) TAG="v${TAG}" ;; esac
+            gh api "repos/nushell/nushell/releases/tags/${TAG}" --jq .tag_name >/dev/null \
+              || { echo "::error::上游 nushell/nushell 不存在版本 ${TAG}"; exit 1; }
+            echo "🎯 手动指定版本: ${TAG}"
+          else
+            TAG=$(gh api repos/nushell/nushell/releases/latest --jq .tag_name)
+            echo "🔎 上游最新稳定版: ${TAG}"
+          fi
+
+          VERSION=${TAG#v}
+          VERSION_CODE=$(date -u +%Y%m%d)
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "version_code=$VERSION_CODE"
+            echo "zip_name=nushell-magisk-${TAG}.zip"
+          } >> "$GITHUB_OUTPUT"
+
+          # 2️⃣ 幂等检查：该版本已发布且未勾选强制重建时，跳过后续构建
+          if [ "$FORCE" != "true" ] \
+            && git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "${TAG}"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "⏭️ ${TAG} 已发布过，跳过构建（如需重建请手动触发并勾选「强制重建」）"
+            exit 0
+          fi
+
+          echo "✅ 目标版本: ${TAG} (versionCode=${VERSION_CODE})"
+
+      - name: ⏭️ Already up to date
+        if: steps.meta.outputs.skip == 'true'
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
-          mkdir -p nushell/system/bin
-          
-          # 写入 module.prop
-          cat <<EOF > nushell/module.prop
-          id=nushell
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## ⏭️ 无需构建
+
+          Nushell **${TAG}** 模块已发布，本次跳过。
+          如需重建，请手动触发 Workflow 并勾选 **💪 强制重建**。
+          EOF
+          echo "已生成跳过摘要"
+
+      # ── 2️⃣ 按 KernelSU 规范搭建模块骨架 ─────────────────────────
+      - name: 🧱 Prepare module structure
+        if: steps.meta.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+          AUTHOR: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          echo "::group::📁 创建目录骨架"
+          mkdir -p "$MOD_DIR/system/bin"
+          echo "  $MOD_DIR/"
+          echo "  ├── module.prop"
+          echo "  ├── customize.sh"
+          echo "  └── system/bin/nu  (稍后放入)"
+          echo "::endgroup::"
+
+          echo "::group::📝 生成 module.prop"
+          # 规范: id 匹配 ^[a-zA-Z][a-zA-Z0-9._-]+$；versionCode 为整数；LF 换行
+          cat > "$MOD_DIR/module.prop" <<EOF
+          id=${MOD_ID}
           name=Nushell for Android
-          version=${{ steps.get_tag.outputs.TAG }}
-          versionCode=$(date +%Y%m%d)
-          author=GitHub Action
-          description=A modern shell for the GitHub era. Powered by Nushell ${{ steps.get_tag.outputs.TAG }}.
+          version=${TAG}
+          versionCode=${VERSION_CODE}
+          author=${AUTHOR}
+          description=A modern shell for the GitHub era. Powered by Nushell ${TAG} (arm64).
+          EOF
+          cat "$MOD_DIR/module.prop"
+          echo "::endgroup::"
+
+          echo "::group::📝 生成 customize.sh"
+          # 规范: 用 ui_print/abort 代替 echo/exit；set_perm 设置权限
+          cat > "$MOD_DIR/customize.sh" <<'EOF'
+          #!/system/bin/sh
+          # ============================================================
+          # 🐚 Nushell for Android @NU_VERSION@
+          # 兼容 KernelSU / Magisk（遵循 KernelSU 模块规范）
+          # https://kernelsu.org/guide/module.html
+          # ============================================================
+
+          SKIPUNZIP=0 # 使用安装器默认解压流程
+
+          ui_print "=========================================="
+          ui_print " 🐚 Nushell for Android @NU_VERSION@"
+          ui_print "=========================================="
+
+          # 本模块仅携带 aarch64 二进制，架构不符立即中止安装
+          if [ "$ARCH" != "arm64" ]; then
+            abort "! 不支持的架构: ${ARCH:-unknown}，本模块仅支持 arm64"
+          fi
+          ui_print "- 设备架构: arm64 (Android API $API)"
+
+          # KernelSU 提示: 通过 system/ 目录修改 /system 需要 metamodule
+          if [ "$KSU" = "true" ]; then
+            ui_print "- 检测到 KernelSU $KSU_VER"
+            ui_print "- ⚠️ 挂载 system/ 需要安装 metamodule"
+            ui_print "   （如 meta-overlayfs），否则模块不会生效"
+          fi
+
+          # 按规范设置二进制权限 (root:root 0755)
+          set_perm "$MODPATH/system/bin/nu" 0 0 0755
+
+          ui_print "- ✅ 安装完成，重启后生效"
+          ui_print "- 💡 打开终端输入 nu 即可使用"
+          EOF
+          sed -i "s/@NU_VERSION@/${TAG}/" "$MOD_DIR/customize.sh"
+          cat "$MOD_DIR/customize.sh"
+          echo "::endgroup::"
+
+      # ── 3️⃣ 下载并安装上游二进制 ─────────────────────────────────
+      - name: ⬇️ Download Nushell binary
+        if: steps.meta.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          URL="https://github.com/nushell/nushell/releases/download/${TAG}/nu-${VERSION}-${NU_TARGET}.tar.gz"
+          echo "::group::🌐 下载 ${URL}"
+          curl -fL --retry 3 --retry-delay 5 --progress-bar -o /tmp/nu.tar.gz "$URL"
+          ls -lh /tmp/nu.tar.gz
+          echo "::endgroup::"
+
+          echo "::group::🗜️ 解压并放入模块"
+          mkdir -p /tmp/nu-src
+          tar -xzf /tmp/nu.tar.gz -C /tmp/nu-src --strip-components=1
+          mv /tmp/nu-src/nu "$MOD_DIR/system/bin/nu"
+          chmod 0755 "$MOD_DIR/system/bin/nu"
+          echo "::endgroup::"
+
+          echo "::group::🔬 二进制体检"
+          file "$MOD_DIR/system/bin/nu"
+          ls -lh "$MOD_DIR/system/bin/nu"
+          file -b "$MOD_DIR/system/bin/nu" | grep -qi aarch64 \
+            || { echo "::error::二进制不是 aarch64，架构不匹配"; exit 1; }
+          echo "✅ aarch64 二进制校验通过"
+          echo "::endgroup::"
+
+      # ── 4️⃣ 对照 KernelSU 规范校验模块 ───────────────────────────
+      - name: ✅ Validate module spec
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          cd "$MOD_DIR"
+          echo "::group::🔎 module.prop 规范校验"
+          grep -Eq '^id=[a-zA-Z][a-zA-Z0-9._-]+$' module.prop \
+            || { echo "::error::id 不符合规范 ^[a-zA-Z][a-zA-Z0-9._-]+$"; exit 1; }
+          grep -Eq '^versionCode=[0-9]+$' module.prop \
+            || { echo "::error::versionCode 必须是整数"; exit 1; }
+          if grep -q $'\r' module.prop customize.sh 2>/dev/null; then
+            echo "::error::检测到 CRLF，module.prop / customize.sh 必须为 LF 换行"
+            exit 1
+          fi
+          echo "✅ id / versionCode / LF 换行均符合规范"
+          echo "::endgroup::"
+
+          echo "::group::🌳 模块最终结构"
+          find . | sort | sed 's|^\./||'
+          echo "::endgroup::"
+
+      # ── 5️⃣ 打包（module.prop 必须位于 zip 根目录）──────────────
+      - name: 📦 Pack module zip
+        if: steps.meta.outputs.skip != 'true'
+        id: pack
+        env:
+          ZIP_NAME: ${{ steps.meta.outputs.zip_name }}
+        run: |
+          set -euo pipefail
+          echo "::group::🗜️ 打包 ${ZIP_NAME}"
+          (cd "$MOD_DIR" && zip -r9X "../${ZIP_NAME}" .)
+          echo "::endgroup::"
+
+          echo "::group::📋 zip 内容清单"
+          unzip -l "$ZIP_NAME"
+          echo "::endgroup::"
+
+          SHA256=$(sha256sum "$ZIP_NAME" | awk '{print $1}')
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "::group::🔐 SHA256 校验和"
+          echo "$SHA256  $ZIP_NAME"
+          echo "::endgroup::"
+
+      # ── 6️⃣ 生成构建摘要与 Release 说明 ─────────────────────────
+      - name: 📝 Generate summary & release notes
+        if: steps.meta.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+          ZIP_NAME: ${{ steps.meta.outputs.zip_name }}
+          SHA256: ${{ steps.pack.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          RELEASE_URL="https://github.com/nushell/nushell/releases/tag/${TAG}"
+
+          cat > release_notes.md <<'EOF'
+          ## 🐚 Nushell for Android @TAG@
+
+          依据 [KernelSU 模块规范](https://kernelsu.org/guide/module.html) 自动构建，
+          兼容 KernelSU 与 Magisk。
+
+          | 项目 | 值 |
+          | ---- | ---- |
+          | 上游版本 | [@TAG@](@RELEASE_URL@) |
+          | versionCode | @VERSION_CODE@ |
+          | 模块 ID | nushell_magisk |
+          | 架构 | arm64 (aarch64-unknown-linux-musl) |
+          | 产物 | @ZIP_NAME@ |
+          | SHA256 | `@SHA256@` |
+
+          ### 📲 安装
+
+          1. 在 KernelSU 管理器或 Magisk 中刷入 `@ZIP_NAME@`
+          2. 重启设备生效
+          3. 终端中运行 `nu`
+
+          > [!WARNING]
+          > KernelSU 用户注意：本模块通过 `system/` 目录修改 `/system/bin/nu`，
+          > 需要安装 metamodule（如 [meta-overlayfs](https://github.com/tiann/KernelSU/releases)）才能挂载生效。
+
+          ### 🌳 模块结构
+
+          ```txt
+          module.prop
+          customize.sh
+          system/
+          └── bin/
+              └── nu
+          ```
+
+          ---
+          🔗 上游二进制: @RELEASE_URL@ · 🤖 由 GitHub Actions 自动构建
           EOF
 
-      - name: Download & Extract Nushell
-        run: |
-          # 下载 aarch64-linux-android 版本
-          # https://github.com/nushell/nushell/releases/download/0.111.0/nu-0.111.0-aarch64-unknown-linux-musl.tar.gz
-          URL="https://github.com/nushell/nushell/releases/download/${{ steps.get_tag.outputs.TAG }}/nu-${{ steps.get_tag.outputs.VERSION }}-aarch64-unknown-linux-musl.tar.gz"
-          curl -L $URL -o nushell.tar.gz
-          tar -xzf nushell.tar.gz
-          
-          # 将二进制文件移动到模块目录
-          mv nu-*/nu nushell/system/bin/
-          chmod +x nushell/system/bin/nu
+          sed -i \
+            -e "s|@TAG@|${TAG}|g" \
+            -e "s|@VERSION_CODE@|${VERSION_CODE}|g" \
+            -e "s|@RELEASE_URL@|${RELEASE_URL}|g" \
+            -e "s|@ZIP_NAME@|${ZIP_NAME}|g" \
+            -e "s|@SHA256@|${SHA256}|g" \
+            release_notes.md
 
-      - name: Zip Module
-        run: |
-          cd nushell
-          zip -r ../nushell-${{ steps.get_tag.outputs.TAG }}.zip ./*
-          
-      - name: Upload Artifact
+          cp release_notes.md "$GITHUB_STEP_SUMMARY"
+          echo "✅ 构建摘要已写入 Step Summary"
+
+      # ── 7️⃣ 上传构建产物 ────────────────────────────────────────
+      - name: 📤 Upload artifact
+        if: steps.meta.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: nushell
-          path: nushell-*.zip
+          name: nushell-module-${{ steps.meta.outputs.version }}
+          path: nushell-magisk-*.zip
+          if-no-files-found: error
 
-      - name: Create Release
+      # ── 8️⃣ 发布 Release ───────────────────────────────────────
+      - name: 🚀 Publish release
+        if: github.event_name != 'pull_request' && steps.meta.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
-        if: github.event_name != 'pull_request'
         with:
-          tag_name: ${{ steps.get_tag.outputs.TAG }}
-          files: nushell-*.zip
-          body: |
-            Automated build of Nushell ${{ steps.get_tag.outputs.TAG }} for Magisk.
-            Binary source: [Nushell Releases](https://github.com/nushell/nushell/releases)
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: 🐚 Nushell ${{ steps.meta.outputs.tag }}
+          files: nushell-magisk-*.zip
+          body_path: release_notes.md
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
